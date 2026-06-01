@@ -35,6 +35,15 @@ ALLOWED_SLACK_USER_IDS = {
     x.strip() for x in os.getenv("ALLOWED_SLACK_USER_IDS", "").split(",") if x.strip()
 }
 
+# Bot-to-bot CRM handoffs
+# Keep this ON only for explicit, structured handoffs from tools like Viktor.
+# A bot message is processed only if it contains CRM_HANDOFF_KEYWORD.
+ACCEPT_BOT_HANDOFFS = os.getenv("ACCEPT_BOT_HANDOFFS", "true").lower() in {"1", "true", "yes", "y"}
+CRM_HANDOFF_KEYWORD = os.getenv("CRM_HANDOFF_KEYWORD", "CRM_HANDOFF").strip()
+CRM_HANDOFF_CHANNEL_IDS = {
+    x.strip() for x in os.getenv("CRM_HANDOFF_CHANNEL_IDS", "").split(",") if x.strip()
+}
+
 NY_TZ = ZoneInfo("America/New_York")
 PENDING: Dict[str, Dict[str, Any]] = {}
 
@@ -60,6 +69,35 @@ def is_allowed(user_id: Optional[str]) -> bool:
     if not ALLOWED_SLACK_USER_IDS:
         return True
     return bool(user_id and user_id in ALLOWED_SLACK_USER_IDS)
+
+
+def is_bot_handoff_event(event: Dict[str, Any], raw_text: str) -> bool:
+    """Allow bot-originated CRM handoffs without opening the door to bot loops.
+
+    Normal bot messages are ignored. A bot message is processed only when:
+    - ACCEPT_BOT_HANDOFFS=true
+    - the message contains CRM_HANDOFF_KEYWORD, default CRM_HANDOFF
+    - if CRM_HANDOFF_CHANNEL_IDS is set, the message came from one of those channels
+
+    This lets Viktor or another email/transcript bot feed CopperChief cleanly while
+    avoiding accidental bot-to-bot loops.
+    """
+    if not event.get("bot_id"):
+        return False
+    if not ACCEPT_BOT_HANDOFFS:
+        return False
+    if not CRM_HANDOFF_KEYWORD:
+        return False
+    if CRM_HANDOFF_KEYWORD.lower() not in (raw_text or "").lower():
+        return False
+    if CRM_HANDOFF_CHANNEL_IDS and event.get("channel") not in CRM_HANDOFF_CHANNEL_IDS:
+        return False
+    return True
+
+
+def bot_source_name(event: Dict[str, Any]) -> str:
+    profile = event.get("bot_profile") or {}
+    return profile.get("name") or profile.get("app_name") or event.get("bot_id") or "bot"
 
 
 def clean_slack_text(text: str) -> str:
@@ -580,6 +618,7 @@ I’m alive. Here’s how to use me:
 • `@{BOT_DISPLAY_NAME} todos` — show open Copper tasks
 • `@{BOT_DISPLAY_NAME} Had a call with Sarah at XYZ Ventures...` — draft a CRM update
 • Paste/upload a `.txt`, `.md`, `.vtt`, or `.srt` transcript and mention me — I’ll draft the CRM update
+• Bot handoffs are allowed only when the message contains `{CRM_HANDOFF_KEYWORD}` — useful for Viktor/email monitoring
 
 By default I ask for approval before writing to Copper. That is intentional. 🛡️
 """.strip()
@@ -614,12 +653,22 @@ def handle_command(text: str, user_id: str) -> Optional[str]:
     return None
 
 
-def process_text_for_crm(text: str, channel: str, user_id: str, say: Any, client: Any, thread_ts: Optional[str]) -> None:
-    if not is_allowed(user_id):
+def process_text_for_crm(
+    text: str,
+    channel: str,
+    user_id: Optional[str],
+    say: Any,
+    client: Any,
+    thread_ts: Optional[str],
+    *,
+    bypass_user_gate: bool = False,
+    source_label: Optional[str] = None,
+) -> None:
+    if not bypass_user_gate and not is_allowed(user_id):
         say("I’m configured to ignore CRM commands from this Slack user.", thread_ts=thread_ts)
         return
 
-    command_response = handle_command(text, user_id)
+    command_response = handle_command(text, user_id or "")
     if command_response:
         say(command_response, thread_ts=thread_ts)
         return
@@ -627,6 +676,9 @@ def process_text_for_crm(text: str, channel: str, user_id: str, say: Any, client
     if len(text.strip()) < 8:
         say(help_text(), thread_ts=thread_ts)
         return
+
+    if source_label:
+        text = f"Source: {source_label}\n\n{text}"
 
     say("Reading this and drafting the Copper update…", thread_ts=thread_ts)
     try:
@@ -665,27 +717,52 @@ def process_text_for_crm(text: str, channel: str, user_id: str, say: Any, client
 # -----------------------------
 @app.event("app_mention")
 def on_app_mention(event, say, client):
-    if event.get("bot_id"):
+    raw_text = event.get("text") or ""
+    bot_handoff = is_bot_handoff_event(event, raw_text)
+    if event.get("bot_id") and not bot_handoff:
         return
+
     user_id = event.get("user")
     channel = event.get("channel")
     thread_ts = event.get("thread_ts") or event.get("ts")
-    text = clean_slack_text(event.get("text") or "")
+    text = clean_slack_text(raw_text)
     text += download_text_files_from_event(event, client)
-    process_text_for_crm(text, channel, user_id, say, client, thread_ts)
+    process_text_for_crm(
+        text,
+        channel,
+        user_id,
+        say,
+        client,
+        thread_ts,
+        bypass_user_gate=bot_handoff,
+        source_label=f"Slack bot handoff from {bot_source_name(event)}" if bot_handoff else None,
+    )
 
 
 @app.event("message")
 def on_message(event, say, client):
-    # Only DMs are subscribed in the manifest. Ignore bot messages.
-    if event.get("bot_id"):
+    # DMs are subscribed in the manifest. Bot messages are ignored unless they are
+    # explicit CRM_HANDOFF messages, which is the clean path for Viktor/email agents.
+    raw_text = event.get("text") or ""
+    bot_handoff = is_bot_handoff_event(event, raw_text)
+    if event.get("bot_id") and not bot_handoff:
         return
+
     user_id = event.get("user")
     channel = event.get("channel")
     thread_ts = event.get("thread_ts") or event.get("ts")
-    text = clean_slack_text(event.get("text") or "")
+    text = clean_slack_text(raw_text)
     text += download_text_files_from_event(event, client)
-    process_text_for_crm(text, channel, user_id, say, client, thread_ts)
+    process_text_for_crm(
+        text,
+        channel,
+        user_id,
+        say,
+        client,
+        thread_ts,
+        bypass_user_gate=bot_handoff,
+        source_label=f"Slack bot handoff from {bot_source_name(event)}" if bot_handoff else None,
+    )
 
 
 @app.action("approve_update")
@@ -741,5 +818,12 @@ def on_reject(ack, body, client):
 
 
 if __name__ == "__main__":
-    log.info("Starting %s. approval_required=%s dry_run=%s", BOT_DISPLAY_NAME, APPROVAL_REQUIRED, COPPER_DRY_RUN)
+    log.info(
+        "Starting %s. approval_required=%s dry_run=%s accept_bot_handoffs=%s handoff_keyword=%s",
+        BOT_DISPLAY_NAME,
+        APPROVAL_REQUIRED,
+        COPPER_DRY_RUN,
+        ACCEPT_BOT_HANDOFFS,
+        CRM_HANDOFF_KEYWORD,
+    )
     SocketModeHandler(app, SLACK_APP_TOKEN).start()
