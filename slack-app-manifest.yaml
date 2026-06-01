@@ -1,0 +1,28 @@
+display_information:
+  name: Copper Chief of Staff
+  description: Updates Copper CRM from Slack posts and transcripts.
+  background_color: "#2f6fed"
+features:
+  bot_user:
+    display_name: CopperChief
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - chat:write
+      - channels:history
+      - groups:history
+      - im:history
+      - files:read
+      - channels:join
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.im
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
