@@ -614,8 +614,18 @@ def is_lookup_command(text: str) -> Optional[Tuple[str, str]]:
     cleaned = re.sub(r"\s+", " ", (text or "").strip())
     patterns = [
         ("lookup", r"^lookup\s+(.+)$"),
+        ("lookup", r"^look\s+up\s+(.+)$"),
+        ("lookup", r"^look-up\s+(.+)$"),
         ("about", r"^tell\s+me\s+about\s+(.+)$"),
+        ("context", r"^context\s+(?:on|for|about)\s+(.+)$"),
+        ("context", r"^interactions?\s+(?:with|for)\s+(.+)$"),
+        ("context", r"^last\s+contact\s+(?:with\s+)?(.+)$"),
+        ("context", r"^last\s+contacted\s+(.+)$"),
+        ("context", r"^when\s+did\s+we\s+last\s+contact\s+(.+)$"),
+        ("rejection", r"^why\s+did\s+(.+?)\s+(?:reject|pass|say\s+no)(?:\s+us)?$"),
+        ("rejection", r"^why\s+did\s+we\s+lose\s+(.+)$"),
         ("person", r"^who\s+is\s+(.+)$"),
+        ("person", r"^who's\s+(.+)$"),
         ("lookup", r"^what\s+do\s+we\s+know\s+about\s+(.+)$"),
         ("deal", r"^deal\s+(.+)$"),
         ("company", r"^company\s+(.+)$"),
@@ -632,8 +642,9 @@ def is_lookup_command(text: str) -> Optional[Tuple[str, str]]:
 
 def _value(record: Dict[str, Any], *keys: str) -> Optional[Any]:
     for key in keys:
-        if record.get(key) not in {None, ""}:
-            return record.get(key)
+        value = record.get(key)
+        if value is not None and value != "":
+            return value
     return None
 
 
@@ -666,7 +677,7 @@ def _record_label(entity_type: str, record: Dict[str, Any]) -> str:
     elif entity_type == "opportunity":
         if record.get("status"):
             bits.append(f"Status: {record['status']}")
-        if record.get("monetary_value") not in {None, ""}:
+        if record.get("monetary_value") is not None and record.get("monetary_value") != "":
             bits.append(f"Value: {record['monetary_value']}")
         if record.get("company_name"):
             bits.append(f"Company: {record['company_name']}")
@@ -679,6 +690,66 @@ def _safe_search(entity: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     except Exception:
         log.exception("Copper lookup search failed for %s", entity)
         return []
+
+
+def _compact_text(value: Any, limit: int = 260) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return truncate(text, limit)
+
+
+def _timestamp_from_value(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+        dt = date_parser.parse(str(value))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=NY_TZ)
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
+def _timestamp_from_record(record: Dict[str, Any], *keys: str) -> Optional[int]:
+    for key in keys:
+        ts = _timestamp_from_value(record.get(key))
+        if ts:
+            return ts
+    return None
+
+
+def _format_date_from_ts(ts: Optional[int]) -> str:
+    if not ts:
+        return "unknown"
+    try:
+        return datetime.fromtimestamp(int(ts), tz=NY_TZ).strftime("%Y-%m-%d")
+    except Exception:
+        return "unknown"
+
+
+def _record_details(record: Dict[str, Any]) -> str:
+    fields = [
+        record.get("details"),
+        record.get("description"),
+        record.get("note"),
+        record.get("loss_reason"),
+        record.get("win_loss_reason"),
+    ]
+    for value in fields:
+        text = _compact_text(value)
+        if text:
+            return text
+    custom_fields = record.get("custom_fields")
+    if isinstance(custom_fields, list):
+        custom_bits = []
+        for item in custom_fields[:6]:
+            if isinstance(item, dict) and item.get("value"):
+                custom_bits.append(str(item["value"]))
+        return _compact_text("; ".join(custom_bits))
+    return ""
 
 
 def _related_tasks_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit: int = 5) -> List[Dict[str, Any]]:
@@ -709,11 +780,11 @@ def _related_tasks_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit: 
     return tasks
 
 
-def _recent_activity_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit: int = 4) -> List[Dict[str, Any]]:
+def _recent_activity_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit: int = 8) -> List[Dict[str, Any]]:
     activities: List[Dict[str, Any]] = []
     seen: set = set()
     for entity_type, records in records_by_type.items():
-        for record in records[:1]:
+        for record in records[:2]:
             record_id = record.get("id")
             if not record_id:
                 continue
@@ -734,8 +805,80 @@ def _recent_activity_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit
                 seen.add(activity_id)
                 activities.append(activity)
                 if len(activities) >= limit:
-                    return activities
-    return activities
+                    return sorted(
+                        activities,
+                        key=lambda a: _timestamp_from_record(a, "activity_date", "date_created", "date_modified", "created_at", "updated_at") or 0,
+                        reverse=True,
+                    )
+    return sorted(
+        activities,
+        key=lambda a: _timestamp_from_record(a, "activity_date", "date_created", "date_modified", "created_at", "updated_at") or 0,
+        reverse=True,
+    )
+
+
+def _rejection_context(opportunities: List[Dict[str, Any]], activities: List[Dict[str, Any]]) -> List[str]:
+    rejection_words = re.compile(r"\b(reject|rejected|pass|passed|declin|not a fit|no for now|lost|said no)\b", re.IGNORECASE)
+    lines: List[str] = []
+
+    for opp in opportunities[:5]:
+        status = str(opp.get("status") or "").lower()
+        details = _record_details(opp)
+        if status == "lost" or rejection_words.search(details):
+            name = opp.get("name") or f"Opportunity #{opp.get('id')}"
+            reason = details or "Marked lost/rejected in Copper, but no reason text was found."
+            lines.append(f"• {name}: {truncate(reason, 260)}")
+            if len(lines) >= 3:
+                return lines
+
+    for activity in activities:
+        details = _compact_text(activity.get("details") or activity.get("body"), 260)
+        if details and rejection_words.search(details):
+            date_text = _format_date_from_ts(_timestamp_from_record(activity, "activity_date", "date_created", "created_at"))
+            lines.append(f"• {date_text}: {details}")
+            if len(lines) >= 3:
+                return lines
+
+    return lines
+
+
+def _relationship_context_lines(
+    records_by_type: Dict[str, List[Dict[str, Any]]],
+    activities: List[Dict[str, Any]],
+    tasks: List[Dict[str, Any]],
+) -> List[str]:
+    lines: List[str] = []
+    dated_activities = [
+        (_timestamp_from_record(a, "activity_date", "date_created", "date_modified", "created_at", "updated_at"), a)
+        for a in activities
+    ]
+    dated_activities = [(ts, a) for ts, a in dated_activities if ts]
+    latest = max(dated_activities, key=lambda item: item[0]) if dated_activities else None
+
+    if latest:
+        latest_text = _compact_text(latest[1].get("details") or latest[1].get("body") or "Activity found", 180)
+        lines.append(f"• Last contact/activity: {_format_date_from_ts(latest[0])} — {latest_text}")
+    else:
+        modified_dates = []
+        for records in records_by_type.values():
+            for record in records[:3]:
+                ts = _timestamp_from_record(record, "date_modified", "updated_at", "date_created", "created_at")
+                if ts:
+                    modified_dates.append(ts)
+        if modified_dates:
+            lines.append(f"• Last Copper record change: {_format_date_from_ts(max(modified_dates))}")
+
+    if activities:
+        lines.append(f"• Recent interactions found: {len(activities)}")
+    if tasks:
+        lines.append(f"• Open follow-ups: {len(tasks)}")
+
+    rejection_lines = _rejection_context(records_by_type.get("opportunity") or [], activities)
+    if rejection_lines:
+        lines.append("• Rejection/lost-deal context:")
+        lines.extend(rejection_lines)
+
+    return lines
 
 
 def format_lookup(query_type: str, query: str) -> str:
@@ -768,17 +911,23 @@ def format_lookup(query_type: str, query: str) -> str:
         lines.extend(f"• {_record_label('opportunity', o)}" for o in opportunities[:3])
 
     tasks = _related_tasks_for(records_by_type)
+    activities = _recent_activity_for(records_by_type)
+    context_lines = _relationship_context_lines(records_by_type, activities, tasks)
+    if context_lines:
+        lines.append("\n*Relationship context*")
+        lines.extend(context_lines)
+
     if tasks:
         lines.append("\n*Open tasks*")
         for task in tasks[:5]:
             lines.append(f"• {task.get('name') or 'Untitled task'} — {unix_to_date(task.get('due_date'))} — priority {task.get('priority') or 'None'}")
 
-    activities = _recent_activity_for(records_by_type)
     if activities:
         lines.append("\n*Recent activity/notes*")
         for activity in activities[:4]:
-            details = re.sub(r"\s+", " ", str(activity.get("details") or activity.get("body") or "Activity found")).strip()
-            lines.append(f"• {truncate(details, 220)}")
+            date_text = _format_date_from_ts(_timestamp_from_record(activity, "activity_date", "date_created", "created_at"))
+            details = _compact_text(activity.get("details") or activity.get("body") or "Activity found", 220)
+            lines.append(f"• {date_text}: {details}")
 
     return truncate("\n".join(lines), 3500)
 
@@ -788,13 +937,18 @@ def help_text() -> str:
 I’m alive. Here’s how to use me:
 
 LOOKUP_FIX_ACTIVE_2026_06_04
+LOOKUP_LOOK_UP_ALIAS_ACTIVE_2026_06_04
+LOOKUP_CONTEXT_ACTIVE_2026_06_04
 
 • `@{BOT_DISPLAY_NAME} ping` — test that I’m running
 • `@{BOT_DISPLAY_NAME} pipelines` — show Copper pipeline/stage IDs
 • `@{BOT_DISPLAY_NAME} todos` — show open Copper tasks
 • `@{BOT_DISPLAY_NAME} lookup Dominik Steiner` — look up matching Copper records
+• `@{BOT_DISPLAY_NAME} look up Innospark Ventures` — look up matching Copper records
 • `@{BOT_DISPLAY_NAME} tell me about Innospark Ventures` — summarize a person/company/deal
 • `@{BOT_DISPLAY_NAME} who is Dominik Steiner` — read-only person lookup
+• `@{BOT_DISPLAY_NAME} last contact with Innospark Ventures` — show recent context and interactions
+• `@{BOT_DISPLAY_NAME} why did Innospark Ventures pass us` — look for rejection/lost-deal context
 • `@{BOT_DISPLAY_NAME} Had a call with Sarah at XYZ Ventures...` — draft a CRM update
 • Paste/upload a `.txt`, `.md`, `.vtt`, or `.srt` transcript and mention me — I’ll draft the CRM update
 • Bot handoffs are allowed only when the message contains `{CRM_HANDOFF_KEYWORD}` — useful for Viktor/email monitoring
