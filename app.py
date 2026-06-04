@@ -692,6 +692,31 @@ def _safe_search(entity: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         return []
 
 
+def _optional_search(entity: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    try:
+        return copper.search(entity, payload)
+    except Exception as e:
+        log.info("Optional Copper lookup search unavailable for %s payload=%s error=%s", entity, payload, str(e)[:180])
+        return []
+
+
+def _dedupe_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for record in records:
+        record_id = record.get("id")
+        fallback = (
+            str(record.get("name") or record.get("title") or "").strip().lower(),
+            str(_first_email(record) or "").strip().lower(),
+        )
+        key = record_id or fallback
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(record)
+    return deduped
+
+
 def _compact_text(value: Any, limit: int = 260) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     return truncate(text, limit)
@@ -780,17 +805,58 @@ def _related_tasks_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit: 
     return tasks
 
 
-def _recent_activity_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit: int = 8) -> List[Dict[str, Any]]:
+def _activity_signature(activity: Dict[str, Any]) -> Tuple[Any, ...]:
+    activity_id = activity.get("id")
+    if activity_id:
+        return ("id", activity_id)
+    body = _compact_text(activity.get("details") or activity.get("body"), 180).lower()
+    return (
+        "body",
+        _timestamp_from_record(activity, "activity_date", "date_created", "date_modified", "created_at", "updated_at"),
+        body,
+    )
+
+
+def _contact_interaction_count(person: Dict[str, Any]) -> Optional[int]:
+    for key in ("interaction_count", "interactions_count", "total_interactions", "activity_count"):
+        value = person.get(key)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    return None
+
+
+def _team_people_for_companies(companies: List[Dict[str, Any]], limit: int = 10) -> List[Dict[str, Any]]:
+    people: List[Dict[str, Any]] = []
+    for company in companies[:3]:
+        company_id = company.get("id")
+        company_name = company.get("name")
+        email_domain = company.get("email_domain")
+
+        if company_id:
+            people.extend(_optional_search("people", {"company_ids": [company_id], "page_size": limit}))
+            people.extend(_optional_search("people", {"company_id": company_id, "page_size": limit}))
+        if company_name:
+            people.extend(_optional_search("people", {"company_name": company_name, "page_size": limit}))
+        if email_domain:
+            people.extend(_optional_search("people", {"email_domain": email_domain, "page_size": limit}))
+
+    return _dedupe_records(people)[:limit]
+
+
+def _recent_activity_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit: int = 14) -> List[Dict[str, Any]]:
     activities: List[Dict[str, Any]] = []
     seen: set = set()
     for entity_type, records in records_by_type.items():
-        for record in records[:2]:
+        max_records = {"person": 6, "company": 3, "opportunity": 3}.get(entity_type, 2)
+        for record in records[:max_records]:
             record_id = record.get("id")
             if not record_id:
                 continue
             try:
                 found = copper.request("POST", "/activities/search", {
-                    "page_size": 3,
+                    "page_size": 5,
                     "sort_by": "date_created",
                     "sort_direction": "desc",
                     "parent": {"type": entity_type, "id": record_id},
@@ -799,10 +865,11 @@ def _recent_activity_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit
                 log.info("Copper related activity lookup unavailable for %s #%s", entity_type, record_id)
                 continue
             for activity in found:
-                activity_id = activity.get("id")
-                if activity_id in seen:
+                activity["_lookup_parent"] = _value(record, "name", "title") or f"{entity_type} #{record_id}"
+                signature = _activity_signature(activity)
+                if signature in seen:
                     continue
-                seen.add(activity_id)
+                seen.add(signature)
                 activities.append(activity)
                 if len(activities) >= limit:
                     return sorted(
@@ -846,6 +913,7 @@ def _relationship_context_lines(
     records_by_type: Dict[str, List[Dict[str, Any]]],
     activities: List[Dict[str, Any]],
     tasks: List[Dict[str, Any]],
+    team_people: List[Dict[str, Any]],
 ) -> List[str]:
     lines: List[str] = []
     dated_activities = [
@@ -870,6 +938,10 @@ def _relationship_context_lines(
 
     if activities:
         lines.append(f"• Recent interactions found: {len(activities)}")
+    if team_people:
+        team_names = ", ".join([str(p.get("name")) for p in team_people[:5] if p.get("name")])
+        if team_names:
+            lines.append(f"• Team contacts checked: {team_names}")
     if tasks:
         lines.append(f"• Open follow-ups: {len(tasks)}")
 
@@ -884,9 +956,11 @@ def _relationship_context_lines(
 def format_lookup(query_type: str, query: str) -> str:
     log.info("Lookup query detected: type=%s query=%s", query_type, query)
 
-    people = _safe_search("people", {"name": query, "page_size": 5})
+    direct_people = _safe_search("people", {"name": query, "page_size": 5})
     companies = _safe_search("companies", {"name": query, "page_size": 5})
     opportunities = _safe_search("opportunities", {"name": query, "page_size": 5})
+    team_people = _team_people_for_companies(companies)
+    people = _dedupe_records(direct_people + team_people)
     records_by_type = {
         "person": people,
         "company": companies,
@@ -900,9 +974,17 @@ def format_lookup(query_type: str, query: str) -> str:
         )
 
     lines = [f"*Copper lookup:* {query}"]
-    if people:
+    if direct_people:
         lines.append("\n*People*")
-        lines.extend(f"• {_record_label('person', p)}" for p in people[:3])
+        lines.extend(f"• {_record_label('person', p)}" for p in direct_people[:3])
+    if team_people:
+        lines.append("\n*Team contacts at matched companies*")
+        for person in team_people[:6]:
+            label = _record_label("person", person)
+            interaction_count = _contact_interaction_count(person)
+            if interaction_count is not None:
+                label = f"{label} — {interaction_count} interactions"
+            lines.append(f"• {label}")
     if companies:
         lines.append("\n*Companies*")
         lines.extend(f"• {_record_label('company', c)}" for c in companies[:3])
@@ -912,7 +994,7 @@ def format_lookup(query_type: str, query: str) -> str:
 
     tasks = _related_tasks_for(records_by_type)
     activities = _recent_activity_for(records_by_type)
-    context_lines = _relationship_context_lines(records_by_type, activities, tasks)
+    context_lines = _relationship_context_lines(records_by_type, activities, tasks, team_people)
     if context_lines:
         lines.append("\n*Relationship context*")
         lines.extend(context_lines)
@@ -924,10 +1006,11 @@ def format_lookup(query_type: str, query: str) -> str:
 
     if activities:
         lines.append("\n*Recent activity/notes*")
-        for activity in activities[:4]:
+        for activity in activities[:6]:
             date_text = _format_date_from_ts(_timestamp_from_record(activity, "activity_date", "date_created", "created_at"))
+            parent_text = f"{activity.get('_lookup_parent')}: " if activity.get("_lookup_parent") else ""
             details = _compact_text(activity.get("details") or activity.get("body") or "Activity found", 220)
-            lines.append(f"• {date_text}: {details}")
+            lines.append(f"• {date_text}: {parent_text}{details}")
 
     return truncate("\n".join(lines), 3500)
 
@@ -939,6 +1022,7 @@ I’m alive. Here’s how to use me:
 LOOKUP_FIX_ACTIVE_2026_06_04
 LOOKUP_LOOK_UP_ALIAS_ACTIVE_2026_06_04
 LOOKUP_CONTEXT_ACTIVE_2026_06_04
+LOOKUP_TEAM_CONTEXT_ACTIVE_2026_06_04
 
 • `@{BOT_DISPLAY_NAME} ping` — test that I’m running
 • `@{BOT_DISPLAY_NAME} pipelines` — show Copper pipeline/stage IDs
