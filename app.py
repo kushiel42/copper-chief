@@ -836,11 +836,7 @@ def _related_tasks_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit: 
 def _activity_signature(activity: Dict[str, Any]) -> Tuple[Any, ...]:
     body = _normalize_activity_body(activity.get("details") or activity.get("body"))
     if body:
-        return (
-            "body",
-            _timestamp_from_record(activity, "activity_date", "date_created", "date_modified", "created_at", "updated_at"),
-            body[:260],
-        )
+        return ("body", body[:320])
     activity_id = activity.get("id")
     if activity_id:
         return ("id", activity_id)
@@ -880,27 +876,38 @@ def _team_people_for_companies(companies: List[Dict[str, Any]], limit: int = 10)
     return _dedupe_records(people)[:limit]
 
 
-def _recent_activity_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit: int = 24) -> List[Dict[str, Any]]:
+def _activity_search_for_record(entity_type: str, record: Dict[str, Any], sort_direction: str) -> List[Dict[str, Any]]:
+    record_id = record.get("id")
+    if not record_id:
+        return []
+    try:
+        found = copper.request("POST", "/activities/search", {
+            "page_size": 20,
+            "sort_by": "date_created",
+            "sort_direction": sort_direction,
+            "parent": {"type": entity_type, "id": record_id},
+        }) or []
+    except Exception:
+        log.info("Copper related activity lookup unavailable for %s #%s", entity_type, record_id)
+        return []
+
+    parent_name = _value(record, "name", "title") or f"{entity_type} #{record_id}"
+    for activity in found:
+        activity["_lookup_parent"] = parent_name
+    return found
+
+
+def _recent_activity_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit: int = 40) -> List[Dict[str, Any]]:
     activities: List[Dict[str, Any]] = []
     seen: set = set()
     for entity_type, records in records_by_type.items():
         max_records = {"person": 10, "company": 5, "opportunity": 5}.get(entity_type, 2)
         for record in records[:max_records]:
-            record_id = record.get("id")
-            if not record_id:
-                continue
-            try:
-                found = copper.request("POST", "/activities/search", {
-                    "page_size": 20,
-                    "sort_by": "date_created",
-                    "sort_direction": "desc",
-                    "parent": {"type": entity_type, "id": record_id},
-                }) or []
-            except Exception:
-                log.info("Copper related activity lookup unavailable for %s #%s", entity_type, record_id)
-                continue
+            found = (
+                _activity_search_for_record(entity_type, record, "desc")
+                + _activity_search_for_record(entity_type, record, "asc")
+            )
             for activity in found:
-                activity["_lookup_parent"] = _value(record, "name", "title") or f"{entity_type} #{record_id}"
                 signature = _activity_signature(activity)
                 if signature in seen:
                     continue
@@ -1036,6 +1043,18 @@ def _timeline_lines(activities: List[Dict[str, Any]]) -> List[str]:
     return lines
 
 
+def _key_activity_lines(activities: List[Dict[str, Any]]) -> List[str]:
+    if not activities:
+        return []
+    selected = _dedupe_activities(activities[:3] + activities[-4:])
+    selected = sorted(
+        selected,
+        key=lambda a: _timestamp_from_record(a, "activity_date", "date_created", "date_modified", "created_at", "updated_at") or 0,
+        reverse=True,
+    )
+    return [_interaction_line(activity, 190) for activity in selected[:7]]
+
+
 def _relationship_brief(query: str, activities: List[Dict[str, Any]], people: List[Dict[str, Any]], companies: List[Dict[str, Any]]) -> str:
     if not activities:
         return ""
@@ -1071,12 +1090,12 @@ Copper activity timeline:
 
 Return 4-6 concise bullets. Include:
 - who we interacted with
-- the oldest meaningful contact and latest contact
+- the oldest meaningful contact and latest contact using the dates above
 - what happened / context
 - current status or next unresolved question if visible
 - why they rejected/passed/lost interest only if the notes clearly say so; otherwise say no explicit rejection reason found
 
-Do not invent facts. Do not recommend writing to Copper. Keep under 900 characters.
+Do not invent facts. Do not claim an earliest contact date unless it appears in the activity timeline above. Do not recommend writing to Copper. Keep under 900 characters.
 """.strip()
 
     try:
@@ -1155,10 +1174,10 @@ def format_lookup(query_type: str, query: str) -> str:
         for task in tasks[:5]:
             lines.append(f"• {task.get('name') or 'Untitled task'} — {unix_to_date(task.get('due_date'))} — priority {task.get('priority') or 'None'}")
 
-    if activities:
-        lines.append("\n*Recent activity/notes*")
-        for activity in activities[:6]:
-            lines.append(_interaction_line(activity, 220))
+    key_activity_lines = _key_activity_lines(activities)
+    if key_activity_lines:
+        lines.append("\n*Key activity excerpts*")
+        lines.extend(key_activity_lines)
 
     return truncate("\n".join(lines), 3500)
 
@@ -1173,6 +1192,7 @@ LOOKUP_CONTEXT_ACTIVE_2026_06_04
 LOOKUP_TEAM_CONTEXT_ACTIVE_2026_06_04
 LOOKUP_TIMELINE_ACTIVE_2026_06_04
 LOOKUP_RELATIONSHIP_BRIEF_ACTIVE_2026_06_04
+LOOKUP_OLDEST_ACTIVITY_ACTIVE_2026_06_04
 
 • `@{BOT_DISPLAY_NAME} ping` — test that I’m running
 • `@{BOT_DISPLAY_NAME} pipelines` — show Copper pipeline/stage IDs
