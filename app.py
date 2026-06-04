@@ -178,6 +178,7 @@ class CopperClient:
 
     def __init__(self) -> None:
         self._pipelines_cache: Optional[List[Dict[str, Any]]] = None
+        self._activity_types_cache: Optional[List[Dict[str, Any]]] = None
 
     @property
     def headers(self) -> Dict[str, str]:
@@ -213,6 +214,21 @@ class CopperClient:
         if self._pipelines_cache is None or force:
             self._pipelines_cache = self.request("GET", "/pipelines") or []
         return self._pipelines_cache
+
+    def list_activity_types(self, force: bool = False) -> List[Dict[str, Any]]:
+        if self._activity_types_cache is None or force:
+            data = self.request("GET", "/activity_types") or {}
+            activity_types: List[Dict[str, Any]] = []
+            if isinstance(data, dict):
+                for category, items in data.items():
+                    for item in items or []:
+                        if isinstance(item, dict) and item.get("id") is not None:
+                            activity_types.append({
+                                "id": item["id"],
+                                "category": item.get("category") or category,
+                            })
+            self._activity_types_cache = activity_types
+        return self._activity_types_cache
 
     def get_or_create_company(self, company: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         name = (company or {}).get("name")
@@ -712,6 +728,22 @@ def _optional_request(method: str, path: str, payload: Optional[Dict[str, Any]] 
         return None
 
 
+def _activity_type_batches(batch_size: int = 20) -> List[List[Dict[str, Any]]]:
+    try:
+        activity_types = copper.list_activity_types()
+    except Exception as e:
+        log.info("Copper activity type lookup unavailable: %s", str(e)[:180])
+        activity_types = []
+
+    if not activity_types:
+        return [[]]
+
+    batches = []
+    for i in range(0, len(activity_types), batch_size):
+        batches.append(activity_types[i:i + batch_size])
+    return batches
+
+
 def _dedupe_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     deduped: List[Dict[str, Any]] = []
     seen = set()
@@ -903,11 +935,12 @@ def _activity_endpoint_for_record(entity_type: str, record: Dict[str, Any]) -> L
         return []
 
     path = f"/{collection}/{record_id}/activities"
-    found = _optional_request("POST", path, {"page_size": 100})
-    if found is None:
-        found = _optional_request("POST", path, {})
-    if not isinstance(found, list):
-        return []
+    found: List[Dict[str, Any]] = []
+    for activity_types in _activity_type_batches():
+        payload = {"activity_types": activity_types} if activity_types else {}
+        result = _optional_request("POST", path, payload)
+        if isinstance(result, list):
+            found.extend(result)
 
     parent_name = _value(record, "name", "title") or f"{entity_type} #{record_id}"
     for activity in found:
@@ -962,6 +995,21 @@ def _recent_activity_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit
         key=lambda a: _timestamp_from_record(a, "activity_date", "date_created", "date_modified", "created_at", "updated_at") or 0,
         reverse=True,
     )[:limit]
+
+
+def _activity_counts_by_parent(activities: List[Dict[str, Any]]) -> Dict[Tuple[str, int], int]:
+    counts: Dict[Tuple[str, int], int] = {}
+    for activity in activities:
+        parent = activity.get("parent") or {}
+        parent_type = parent.get("type")
+        parent_id = parent.get("id")
+        if parent_type and parent_id:
+            try:
+                key = (str(parent_type), int(parent_id))
+            except Exception:
+                continue
+            counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def _dedupe_activities(activities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1116,6 +1164,20 @@ def _relationship_fact_lines(activities: List[Dict[str, Any]], people: List[Dict
     return lines
 
 
+def _api_gap_lines(activities: List[Dict[str, Any]], people: List[Dict[str, Any]]) -> List[str]:
+    counts = _activity_counts_by_parent(activities)
+    gaps = []
+    for person in people[:8]:
+        expected = _contact_interaction_count(person)
+        person_id = person.get("id")
+        if expected is None or not person_id:
+            continue
+        actual = counts.get(("person", int(person_id)), 0)
+        if expected > actual:
+            gaps.append(f"• Copper shows {expected} interactions for {person.get('name')}, but the API returned {actual} activity rows for that person.")
+    return gaps[:3]
+
+
 def _key_activity_lines(activities: List[Dict[str, Any]]) -> List[str]:
     if not activities:
         return []
@@ -1244,6 +1306,11 @@ def format_lookup(query_type: str, query: str) -> str:
         lines.append("\n*Fetched timeline facts*")
         lines.extend(fact_lines)
 
+    api_gap_lines = _api_gap_lines(activities, people)
+    if api_gap_lines:
+        lines.append("\n*Copper API coverage warning*")
+        lines.extend(api_gap_lines)
+
     brief = _relationship_brief(query, activities, people, companies)
     if brief:
         lines.append("\n*Relationship brief*")
@@ -1279,6 +1346,7 @@ LOOKUP_TIMELINE_ACTIVE_2026_06_04
 LOOKUP_RELATIONSHIP_BRIEF_ACTIVE_2026_06_04
 LOOKUP_OLDEST_ACTIVITY_ACTIVE_2026_06_04
 LOOKUP_ENTITY_ACTIVITY_ENDPOINTS_ACTIVE_2026_06_04
+LOOKUP_ACTIVITY_TYPES_ACTIVE_2026_06_04
 
 • `@{BOT_DISPLAY_NAME} ping` — test that I’m running
 • `@{BOT_DISPLAY_NAME} pipelines` — show Copper pipeline/stage IDs
