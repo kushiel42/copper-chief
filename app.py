@@ -227,6 +227,27 @@ class CopperClient:
                                 "id": item["id"],
                                 "category": item.get("category") or category,
                             })
+            elif isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and item.get("id") is not None:
+                        activity_types.append({
+                            "id": item["id"],
+                            "category": item.get("category") or "user",
+                        })
+
+            try:
+                custom_data = self.request("GET", "/custom_activity_types") or []
+            except Exception as e:
+                log.info("Copper custom activity types unavailable: %s", str(e)[:180])
+                custom_data = []
+            if isinstance(custom_data, list):
+                seen = {(item.get("category"), item.get("id")) for item in activity_types}
+                for item in custom_data:
+                    if isinstance(item, dict) and item.get("id") is not None:
+                        key = ("user", item["id"])
+                        if key not in seen:
+                            activity_types.append({"id": item["id"], "category": "user"})
+                            seen.add(key)
             self._activity_types_cache = activity_types
         return self._activity_types_cache
 
@@ -941,6 +962,14 @@ def _activity_endpoint_for_record(entity_type: str, record: Dict[str, Any]) -> L
         result = _optional_request("POST", path, payload)
         if isinstance(result, list):
             found.extend(result)
+    if not found:
+        result = _optional_request("POST", path, {})
+        if isinstance(result, list):
+            found.extend(result)
+    if not found:
+        result = _optional_request("POST", path, {"activity_types": []})
+        if isinstance(result, list):
+            found.extend(result)
 
     parent_name = _value(record, "name", "title") or f"{entity_type} #{record_id}"
     for activity in found:
@@ -959,6 +988,7 @@ def _activity_search_for_record(entity_type: str, record: Dict[str, Any]) -> Lis
         page = _optional_request("POST", "/activities/search", {
             "page_size": 100,
             "page_number": page_number,
+            "full_result": True,
             "parent": {"type": entity_type, "id": record_id},
         })
         if not isinstance(page, list) or not page:
@@ -1135,6 +1165,15 @@ def _timeline_lines(activities: List[Dict[str, Any]]) -> List[str]:
     return lines
 
 
+def _expected_interactions(people: List[Dict[str, Any]]) -> int:
+    total = 0
+    for person in people:
+        count = _contact_interaction_count(person)
+        if count:
+            total += count
+    return total
+
+
 def _activity_bounds(activities: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     dated = [
         (_timestamp_from_record(a, "activity_date", "date_created", "date_modified", "created_at", "updated_at"), a)
@@ -1176,6 +1215,18 @@ def _api_gap_lines(activities: List[Dict[str, Any]], people: List[Dict[str, Any]
         if expected > actual:
             gaps.append(f"• Copper shows {expected} interactions for {person.get('name')}, but the API returned {actual} activity rows for that person.")
     return gaps[:3]
+
+
+def _lookup_status_lines(activities: List[Dict[str, Any]], people: List[Dict[str, Any]]) -> List[str]:
+    expected = _expected_interactions(people)
+    if activities:
+        return []
+    if expected:
+        return [
+            f"• Copper shows {expected} interaction(s) on the matched people, but the Developer API did not return the activity bodies.",
+            "• I can identify the relevant contacts, but I cannot build the timeline until Copper exposes those synced email/calendar rows to this API token.",
+        ]
+    return []
 
 
 def _key_activity_lines(activities: List[Dict[str, Any]]) -> List[str]:
@@ -1267,12 +1318,12 @@ def format_lookup(query_type: str, query: str) -> str:
             "Try a company name, person name, or alternate spelling."
         )
 
-    lines = [f"*Copper lookup:* {query}"]
+    lines = [f"*Copper relationship lookup:* {query}"]
     if direct_people:
         lines.append("\n*People*")
         lines.extend(f"• {_record_label('person', p)}" for p in direct_people[:3])
     if team_people:
-        lines.append("\n*Team contacts at matched companies*")
+        lines.append("\n*Who we know there*")
         for person in team_people[:6]:
             label = _record_label("person", person)
             interaction_count = _contact_interaction_count(person)
@@ -1296,10 +1347,16 @@ def format_lookup(query_type: str, query: str) -> str:
         len(opportunities),
         len(activities),
     )
-    context_lines = _relationship_context_lines(records_by_type, activities, tasks, team_people)
-    if context_lines:
-        lines.append("\n*Relationship context*")
-        lines.extend(context_lines)
+    status_lines = _lookup_status_lines(activities, people)
+    if status_lines:
+        lines.append("\n*Timeline unavailable from API*")
+        lines.extend(status_lines)
+
+    if activities:
+        context_lines = _relationship_context_lines(records_by_type, activities, tasks, team_people)
+        if context_lines:
+            lines.append("\n*Relationship context*")
+            lines.extend(context_lines)
 
     fact_lines = _relationship_fact_lines(activities, people)
     if fact_lines:
@@ -1347,6 +1404,7 @@ LOOKUP_RELATIONSHIP_BRIEF_ACTIVE_2026_06_04
 LOOKUP_OLDEST_ACTIVITY_ACTIVE_2026_06_04
 LOOKUP_ENTITY_ACTIVITY_ENDPOINTS_ACTIVE_2026_06_04
 LOOKUP_ACTIVITY_TYPES_ACTIVE_2026_06_04
+LOOKUP_TIMELINE_API_GUARD_ACTIVE_2026_06_04
 
 • `@{BOT_DISPLAY_NAME} ping` — test that I’m running
 • `@{BOT_DISPLAY_NAME} pipelines` — show Copper pipeline/stage IDs
