@@ -609,13 +609,192 @@ def format_todos() -> str:
     return truncate("\n".join(lines), 3500)
 
 
+def is_lookup_command(text: str) -> Optional[Tuple[str, str]]:
+    """Detect read-only lookup commands after the bot mention has been removed."""
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    patterns = [
+        ("lookup", r"^lookup\s+(.+)$"),
+        ("about", r"^tell\s+me\s+about\s+(.+)$"),
+        ("person", r"^who\s+is\s+(.+)$"),
+        ("lookup", r"^what\s+do\s+we\s+know\s+about\s+(.+)$"),
+        ("deal", r"^deal\s+(.+)$"),
+        ("company", r"^company\s+(.+)$"),
+        ("person", r"^person\s+(.+)$"),
+    ]
+    for query_type, pattern in patterns:
+        match = re.match(pattern, cleaned, flags=re.IGNORECASE)
+        if match:
+            query = match.group(1).strip(" \t\r\n?.!\"'")
+            if query:
+                return query_type, query
+    return None
+
+
+def _value(record: Dict[str, Any], *keys: str) -> Optional[Any]:
+    for key in keys:
+        if record.get(key) not in {None, ""}:
+            return record.get(key)
+    return None
+
+
+def _first_email(record: Dict[str, Any]) -> Optional[str]:
+    emails = record.get("emails") or []
+    if isinstance(emails, list) and emails:
+        first = emails[0]
+        if isinstance(first, dict):
+            return first.get("email")
+        return str(first)
+    return record.get("email")
+
+
+def _record_label(entity_type: str, record: Dict[str, Any]) -> str:
+    name = _value(record, "name", "title") or f"{entity_type} #{record.get('id')}"
+    bits = [f"*{name}* `#{record.get('id')}`"]
+    if entity_type == "person":
+        if record.get("title"):
+            bits.append(str(record["title"]))
+        email = _first_email(record)
+        if email:
+            bits.append(email)
+        if record.get("company_name"):
+            bits.append(f"Company: {record['company_name']}")
+    elif entity_type == "company":
+        if record.get("email_domain"):
+            bits.append(str(record["email_domain"]))
+        if record.get("phone_number"):
+            bits.append(str(record["phone_number"]))
+    elif entity_type == "opportunity":
+        if record.get("status"):
+            bits.append(f"Status: {record['status']}")
+        if record.get("monetary_value") not in {None, ""}:
+            bits.append(f"Value: {record['monetary_value']}")
+        if record.get("company_name"):
+            bits.append(f"Company: {record['company_name']}")
+    return " — ".join(bits)
+
+
+def _safe_search(entity: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    try:
+        return copper.search(entity, payload)
+    except Exception:
+        log.exception("Copper lookup search failed for %s", entity)
+        return []
+
+
+def _related_tasks_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit: int = 5) -> List[Dict[str, Any]]:
+    tasks: List[Dict[str, Any]] = []
+    seen: set = set()
+    for entity_type, records in records_by_type.items():
+        for record in records[:2]:
+            record_id = record.get("id")
+            if not record_id:
+                continue
+            try:
+                found = copper.search("tasks", {
+                    "page_size": 3,
+                    "statuses": ["Open"],
+                    "related_resource": {"type": entity_type, "id": record_id},
+                })
+            except Exception:
+                log.info("Copper related task lookup unavailable for %s #%s", entity_type, record_id)
+                continue
+            for task in found:
+                task_id = task.get("id")
+                if task_id in seen:
+                    continue
+                seen.add(task_id)
+                tasks.append(task)
+                if len(tasks) >= limit:
+                    return tasks
+    return tasks
+
+
+def _recent_activity_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit: int = 4) -> List[Dict[str, Any]]:
+    activities: List[Dict[str, Any]] = []
+    seen: set = set()
+    for entity_type, records in records_by_type.items():
+        for record in records[:1]:
+            record_id = record.get("id")
+            if not record_id:
+                continue
+            try:
+                found = copper.request("POST", "/activities/search", {
+                    "page_size": 3,
+                    "sort_by": "date_created",
+                    "sort_direction": "desc",
+                    "parent": {"type": entity_type, "id": record_id},
+                }) or []
+            except Exception:
+                log.info("Copper related activity lookup unavailable for %s #%s", entity_type, record_id)
+                continue
+            for activity in found:
+                activity_id = activity.get("id")
+                if activity_id in seen:
+                    continue
+                seen.add(activity_id)
+                activities.append(activity)
+                if len(activities) >= limit:
+                    return activities
+    return activities
+
+
+def format_lookup(query_type: str, query: str) -> str:
+    log.info("Lookup query detected: type=%s query=%s", query_type, query)
+
+    people = _safe_search("people", {"name": query, "page_size": 5})
+    companies = _safe_search("companies", {"name": query, "page_size": 5})
+    opportunities = _safe_search("opportunities", {"name": query, "page_size": 5})
+    records_by_type = {
+        "person": people,
+        "company": companies,
+        "opportunity": opportunities,
+    }
+
+    if not any(records_by_type.values()):
+        return (
+            f"No matching Copper records were found for *{query}*.\n"
+            "Try a company name, person name, or alternate spelling."
+        )
+
+    lines = [f"*Copper lookup:* {query}"]
+    if people:
+        lines.append("\n*People*")
+        lines.extend(f"• {_record_label('person', p)}" for p in people[:3])
+    if companies:
+        lines.append("\n*Companies*")
+        lines.extend(f"• {_record_label('company', c)}" for c in companies[:3])
+    if opportunities:
+        lines.append("\n*Opportunities*")
+        lines.extend(f"• {_record_label('opportunity', o)}" for o in opportunities[:3])
+
+    tasks = _related_tasks_for(records_by_type)
+    if tasks:
+        lines.append("\n*Open tasks*")
+        for task in tasks[:5]:
+            lines.append(f"• {task.get('name') or 'Untitled task'} — {unix_to_date(task.get('due_date'))} — priority {task.get('priority') or 'None'}")
+
+    activities = _recent_activity_for(records_by_type)
+    if activities:
+        lines.append("\n*Recent activity/notes*")
+        for activity in activities[:4]:
+            details = re.sub(r"\s+", " ", str(activity.get("details") or activity.get("body") or "Activity found")).strip()
+            lines.append(f"• {truncate(details, 220)}")
+
+    return truncate("\n".join(lines), 3500)
+
+
 def help_text() -> str:
     return f"""
 I’m alive. Here’s how to use me:
 
+LOOKUP_FIX_ACTIVE_2026_06_04
+
 • `@{BOT_DISPLAY_NAME} ping` — test that I’m running
 • `@{BOT_DISPLAY_NAME} pipelines` — show Copper pipeline/stage IDs
 • `@{BOT_DISPLAY_NAME} todos` — show open Copper tasks
+• `@{BOT_DISPLAY_NAME} lookup Dominik Steiner` — look up matching Copper records
+• `@{BOT_DISPLAY_NAME} tell me about Innospark Ventures` — summarize a person/company/deal
+• `@{BOT_DISPLAY_NAME} who is Dominik Steiner` — read-only person lookup
 • `@{BOT_DISPLAY_NAME} Had a call with Sarah at XYZ Ventures...` — draft a CRM update
 • Paste/upload a `.txt`, `.md`, `.vtt`, or `.srt` transcript and mention me — I’ll draft the CRM update
 • Bot handoffs are allowed only when the message contains `{CRM_HANDOFF_KEYWORD}` — useful for Viktor/email monitoring
@@ -671,6 +850,16 @@ def process_text_for_crm(
     command_response = handle_command(text, user_id or "")
     if command_response:
         say(command_response, thread_ts=thread_ts)
+        return
+
+    lookup_command = is_lookup_command(text)
+    if lookup_command:
+        query_type, query = lookup_command
+        try:
+            say(format_lookup(query_type, query), thread_ts=thread_ts)
+        except Exception as e:
+            log.exception("Copper lookup failed")
+            say(f"Copper lookup failed: `{str(e)[:700]}`", thread_ts=thread_ts)
         return
 
     if len(text.strip()) < 8:
