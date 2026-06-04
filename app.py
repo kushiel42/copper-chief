@@ -1429,9 +1429,15 @@ def handle_command(text: str, user_id: str) -> Optional[str]:
         return help_text()
     if lower in {"ping", "test"}:
         return "pong — I’m connected to Slack. ✅"
-    if lower in {"pipelines", "pipeline", "stages", "setup"}:
+    if lower in {"pipelines", "pipeline", "stages", "setup"} or re.search(
+        r"\b(show|list|what(?:’s| are| is)|get|display)\b.{0,30}\b(pipeline|stage)s?\b", lower
+    ):
         return format_pipelines()
-    if lower in {"todos", "todo", "tasks"}:
+    if lower in {"todos", "todo", "tasks"} or re.search(
+        r"\b(show|list|what(?:’s| are| is)|get|display|pending|open|my)\b.{0,30}\b(task|todo|follow.?up)s?\b", lower
+    ) or re.search(
+        r"\b(task|todo|follow.?up)s?\b.{0,30}\b(pending|open|due|assigned)\b", lower
+    ):
         return format_todos()
 
     approve_match = re.match(r"^(approve|reject)\s+([a-zA-Z0-9_-]+)", lower)
