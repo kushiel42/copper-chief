@@ -189,7 +189,11 @@ class CopperClient:
         }
 
     def request(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Any:
-        if COPPER_DRY_RUN and method.upper() in {"POST", "PUT", "DELETE"} and not path.endswith("/search"):
+        read_only_post = (
+            path.endswith("/search")
+            or bool(re.match(r"^/(people|companies|opportunities|leads)/\d+/activities$", path))
+        )
+        if COPPER_DRY_RUN and method.upper() in {"POST", "PUT", "DELETE"} and not read_only_post:
             log.info("DRY RUN %s %s %s", method, path, payload)
             return {"id": int(time.time()), "dry_run": True, **(payload or {})}
 
@@ -700,6 +704,14 @@ def _optional_search(entity: str, payload: Dict[str, Any]) -> List[Dict[str, Any
         return []
 
 
+def _optional_request(method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Any:
+    try:
+        return copper.request(method, path, payload)
+    except Exception as e:
+        log.info("Optional Copper lookup request unavailable for %s %s error=%s", method, path, str(e)[:180])
+        return None
+
+
 def _dedupe_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     deduped: List[Dict[str, Any]] = []
     seen = set()
@@ -876,36 +888,68 @@ def _team_people_for_companies(companies: List[Dict[str, Any]], limit: int = 10)
     return _dedupe_records(people)[:limit]
 
 
-def _activity_search_for_record(entity_type: str, record: Dict[str, Any], sort_direction: str) -> List[Dict[str, Any]]:
+def _activity_endpoint_for_record(entity_type: str, record: Dict[str, Any]) -> List[Dict[str, Any]]:
     record_id = record.get("id")
     if not record_id:
         return []
-    try:
-        found = copper.request("POST", "/activities/search", {
-            "page_size": 20,
-            "sort_by": "date_created",
-            "sort_direction": sort_direction,
-            "parent": {"type": entity_type, "id": record_id},
-        }) or []
-    except Exception:
-        log.info("Copper related activity lookup unavailable for %s #%s", entity_type, record_id)
+
+    collection_by_type = {
+        "person": "people",
+        "company": "companies",
+        "opportunity": "opportunities",
+    }
+    collection = collection_by_type.get(entity_type)
+    if not collection:
+        return []
+
+    path = f"/{collection}/{record_id}/activities"
+    found = _optional_request("POST", path, {"page_size": 100})
+    if found is None:
+        found = _optional_request("POST", path, {})
+    if not isinstance(found, list):
         return []
 
     parent_name = _value(record, "name", "title") or f"{entity_type} #{record_id}"
     for activity in found:
         activity["_lookup_parent"] = parent_name
+        activity["_lookup_source"] = f"{collection}/{record_id}/activities"
     return found
 
 
-def _recent_activity_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit: int = 40) -> List[Dict[str, Any]]:
+def _activity_search_for_record(entity_type: str, record: Dict[str, Any]) -> List[Dict[str, Any]]:
+    record_id = record.get("id")
+    if not record_id:
+        return []
+
+    found: List[Dict[str, Any]] = []
+    for page_number in range(1, 4):
+        page = _optional_request("POST", "/activities/search", {
+            "page_size": 100,
+            "page_number": page_number,
+            "parent": {"type": entity_type, "id": record_id},
+        })
+        if not isinstance(page, list) or not page:
+            break
+        found.extend(page)
+        if len(page) < 100:
+            break
+
+    parent_name = _value(record, "name", "title") or f"{entity_type} #{record_id}"
+    for activity in found:
+        activity["_lookup_parent"] = parent_name
+        activity["_lookup_source"] = "activities/search"
+    return found
+
+
+def _recent_activity_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit: int = 80) -> List[Dict[str, Any]]:
     activities: List[Dict[str, Any]] = []
     seen: set = set()
     for entity_type, records in records_by_type.items():
         max_records = {"person": 10, "company": 5, "opportunity": 5}.get(entity_type, 2)
         for record in records[:max_records]:
             found = (
-                _activity_search_for_record(entity_type, record, "desc")
-                + _activity_search_for_record(entity_type, record, "asc")
+                _activity_endpoint_for_record(entity_type, record)
+                + _activity_search_for_record(entity_type, record)
             )
             for activity in found:
                 signature = _activity_signature(activity)
@@ -1043,6 +1087,35 @@ def _timeline_lines(activities: List[Dict[str, Any]]) -> List[str]:
     return lines
 
 
+def _activity_bounds(activities: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    dated = [
+        (_timestamp_from_record(a, "activity_date", "date_created", "date_modified", "created_at", "updated_at"), a)
+        for a in activities
+    ]
+    dated = [(ts, activity) for ts, activity in dated if ts]
+    if not dated:
+        return None, None
+    oldest = min(dated, key=lambda item: item[0])[1]
+    latest = max(dated, key=lambda item: item[0])[1]
+    return oldest, latest
+
+
+def _relationship_fact_lines(activities: List[Dict[str, Any]], people: List[Dict[str, Any]]) -> List[str]:
+    if not activities:
+        return []
+
+    oldest, latest = _activity_bounds(activities)
+    lines: List[str] = []
+    contact_names = ", ".join([str(p.get("name")) for p in people[:8] if p.get("name")])
+    if contact_names:
+        lines.append(f"• Contacts checked: {contact_names}")
+    if oldest:
+        lines.append(f"• Earliest fetched Copper activity: {_interaction_line(oldest, 170)[2:]}")
+    if latest:
+        lines.append(f"• Latest fetched Copper activity: {_interaction_line(latest, 170)[2:]}")
+    return lines
+
+
 def _key_activity_lines(activities: List[Dict[str, Any]]) -> List[str]:
     if not activities:
         return []
@@ -1090,12 +1163,11 @@ Copper activity timeline:
 
 Return 4-6 concise bullets. Include:
 - who we interacted with
-- the oldest meaningful contact and latest contact using the dates above
 - what happened / context
 - current status or next unresolved question if visible
 - why they rejected/passed/lost interest only if the notes clearly say so; otherwise say no explicit rejection reason found
 
-Do not invent facts. Do not claim an earliest contact date unless it appears in the activity timeline above. Do not recommend writing to Copper. Keep under 900 characters.
+Do not invent facts. Do not claim earliest or latest contact dates; those are computed separately. Do not recommend writing to Copper. Keep under 700 characters.
 """.strip()
 
     try:
@@ -1154,10 +1226,23 @@ def format_lookup(query_type: str, query: str) -> str:
 
     tasks = _related_tasks_for(records_by_type)
     activities = _recent_activity_for(records_by_type)
+    log.info(
+        "Lookup activity collected: query=%s people=%d companies=%d opportunities=%d activities=%d",
+        query,
+        len(people),
+        len(companies),
+        len(opportunities),
+        len(activities),
+    )
     context_lines = _relationship_context_lines(records_by_type, activities, tasks, team_people)
     if context_lines:
         lines.append("\n*Relationship context*")
         lines.extend(context_lines)
+
+    fact_lines = _relationship_fact_lines(activities, people)
+    if fact_lines:
+        lines.append("\n*Fetched timeline facts*")
+        lines.extend(fact_lines)
 
     brief = _relationship_brief(query, activities, people, companies)
     if brief:
@@ -1193,6 +1278,7 @@ LOOKUP_TEAM_CONTEXT_ACTIVE_2026_06_04
 LOOKUP_TIMELINE_ACTIVE_2026_06_04
 LOOKUP_RELATIONSHIP_BRIEF_ACTIVE_2026_06_04
 LOOKUP_OLDEST_ACTIVITY_ACTIVE_2026_06_04
+LOOKUP_ENTITY_ACTIVITY_ENDPOINTS_ACTIVE_2026_06_04
 
 • `@{BOT_DISPLAY_NAME} ping` — test that I’m running
 • `@{BOT_DISPLAY_NAME} pipelines` — show Copper pipeline/stage IDs
