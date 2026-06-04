@@ -717,9 +717,37 @@ def _dedupe_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return deduped
 
 
+def _query_variants(query: str) -> List[str]:
+    cleaned = re.sub(r"\s+", " ", (query or "").strip())
+    variants = [cleaned]
+    suffix_pattern = r"\s+(ventures?|venture\s+capital|capital|vc|fund|partners?|labs?|inc\.?|llc)$"
+    base = re.sub(suffix_pattern, "", cleaned, flags=re.IGNORECASE).strip()
+    if base and base.lower() != cleaned.lower():
+        variants.append(base)
+    if "." in cleaned:
+        variants.append(cleaned.split(".", 1)[0])
+
+    deduped: List[str] = []
+    seen = set()
+    for value in variants:
+        key = value.lower()
+        if value and key not in seen:
+            seen.add(key)
+            deduped.append(value)
+    return deduped
+
+
 def _compact_text(value: Any, limit: int = 260) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     return truncate(text, limit)
+
+
+def _normalize_activity_body(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip().lower()
+    text = re.sub(r"https?://\S+", "<url>", text)
+    text = re.sub(r"\b(reply all|reply|from:|sent:|to:|cc:)\b", " ", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _timestamp_from_value(value: Any) -> Optional[int]:
@@ -806,14 +834,20 @@ def _related_tasks_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit: 
 
 
 def _activity_signature(activity: Dict[str, Any]) -> Tuple[Any, ...]:
+    body = _normalize_activity_body(activity.get("details") or activity.get("body"))
+    if body:
+        return (
+            "body",
+            _timestamp_from_record(activity, "activity_date", "date_created", "date_modified", "created_at", "updated_at"),
+            body[:260],
+        )
     activity_id = activity.get("id")
     if activity_id:
         return ("id", activity_id)
-    body = _compact_text(activity.get("details") or activity.get("body"), 180).lower()
     return (
-        "body",
+        "unknown",
         _timestamp_from_record(activity, "activity_date", "date_created", "date_modified", "created_at", "updated_at"),
-        body,
+        str(activity.get("_lookup_parent") or "").lower(),
     )
 
 
@@ -833,30 +867,31 @@ def _team_people_for_companies(companies: List[Dict[str, Any]], limit: int = 10)
         company_id = company.get("id")
         company_name = company.get("name")
         email_domain = company.get("email_domain")
+        company_variants = _query_variants(str(company_name or ""))
 
         if company_id:
             people.extend(_optional_search("people", {"company_ids": [company_id], "page_size": limit}))
             people.extend(_optional_search("people", {"company_id": company_id, "page_size": limit}))
-        if company_name:
-            people.extend(_optional_search("people", {"company_name": company_name, "page_size": limit}))
+        for variant in company_variants:
+            people.extend(_optional_search("people", {"company_name": variant, "page_size": limit}))
         if email_domain:
             people.extend(_optional_search("people", {"email_domain": email_domain, "page_size": limit}))
 
     return _dedupe_records(people)[:limit]
 
 
-def _recent_activity_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit: int = 14) -> List[Dict[str, Any]]:
+def _recent_activity_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit: int = 24) -> List[Dict[str, Any]]:
     activities: List[Dict[str, Any]] = []
     seen: set = set()
     for entity_type, records in records_by_type.items():
-        max_records = {"person": 6, "company": 3, "opportunity": 3}.get(entity_type, 2)
+        max_records = {"person": 10, "company": 5, "opportunity": 5}.get(entity_type, 2)
         for record in records[:max_records]:
             record_id = record.get("id")
             if not record_id:
                 continue
             try:
                 found = copper.request("POST", "/activities/search", {
-                    "page_size": 5,
+                    "page_size": 20,
                     "sort_by": "date_created",
                     "sort_direction": "desc",
                     "parent": {"type": entity_type, "id": record_id},
@@ -871,17 +906,23 @@ def _recent_activity_for(records_by_type: Dict[str, List[Dict[str, Any]]], limit
                     continue
                 seen.add(signature)
                 activities.append(activity)
-                if len(activities) >= limit:
-                    return sorted(
-                        activities,
-                        key=lambda a: _timestamp_from_record(a, "activity_date", "date_created", "date_modified", "created_at", "updated_at") or 0,
-                        reverse=True,
-                    )
     return sorted(
         activities,
         key=lambda a: _timestamp_from_record(a, "activity_date", "date_created", "date_modified", "created_at", "updated_at") or 0,
         reverse=True,
-    )
+    )[:limit]
+
+
+def _dedupe_activities(activities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for activity in activities:
+        signature = _activity_signature(activity)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(activity)
+    return deduped
 
 
 def _rejection_context(opportunities: List[Dict[str, Any]], activities: List[Dict[str, Any]]) -> List[str]:
@@ -953,12 +994,112 @@ def _relationship_context_lines(
     return lines
 
 
+def _company_matches_for_query(query: str) -> List[Dict[str, Any]]:
+    companies: List[Dict[str, Any]] = []
+    for variant in _query_variants(query):
+        companies.extend(_optional_search("companies", {"name": variant, "page_size": 5}))
+    return _dedupe_records(companies)
+
+
+def _people_matches_for_query(query: str) -> List[Dict[str, Any]]:
+    people: List[Dict[str, Any]] = []
+    for variant in _query_variants(query):
+        people.extend(_optional_search("people", {"name": variant, "page_size": 5}))
+    return _dedupe_records(people)
+
+
+def _opportunity_matches_for_query(query: str) -> List[Dict[str, Any]]:
+    opportunities: List[Dict[str, Any]] = []
+    for variant in _query_variants(query):
+        opportunities.extend(_optional_search("opportunities", {"name": variant, "page_size": 5}))
+    return _dedupe_records(opportunities)
+
+
+def _interaction_line(activity: Dict[str, Any], limit: int = 230) -> str:
+    date_text = _format_date_from_ts(_timestamp_from_record(activity, "activity_date", "date_created", "created_at"))
+    parent_text = f"{activity.get('_lookup_parent')}: " if activity.get("_lookup_parent") else ""
+    details = _compact_text(activity.get("details") or activity.get("body") or "Activity found", limit)
+    return f"• {date_text}: {parent_text}{details}"
+
+
+def _timeline_lines(activities: List[Dict[str, Any]]) -> List[str]:
+    if not activities:
+        return []
+
+    lines = []
+    latest = activities[0]
+    oldest = activities[-1]
+    latest_date = _format_date_from_ts(_timestamp_from_record(latest, "activity_date", "date_created", "created_at"))
+    oldest_date = _format_date_from_ts(_timestamp_from_record(oldest, "activity_date", "date_created", "created_at"))
+    lines.append(f"• Timeline covered: {oldest_date} to {latest_date}")
+    lines.append(f"• Unique interactions found: {len(activities)}")
+    return lines
+
+
+def _relationship_brief(query: str, activities: List[Dict[str, Any]], people: List[Dict[str, Any]], companies: List[Dict[str, Any]]) -> str:
+    if not activities:
+        return ""
+
+    contact_names = ", ".join([str(p.get("name")) for p in people[:8] if p.get("name")]) or "unknown"
+    company_names = ", ".join([str(c.get("name")) for c in companies[:5] if c.get("name")]) or "unknown"
+    activity_lines = []
+    activity_sample = _dedupe_activities(activities[:10] + activities[-8:])
+    activity_sample = sorted(
+        activity_sample,
+        key=lambda a: _timestamp_from_record(a, "activity_date", "date_created", "date_modified", "created_at", "updated_at") or 0,
+        reverse=True,
+    )
+    for activity in activity_sample[:18]:
+        date_text = _format_date_from_ts(_timestamp_from_record(activity, "activity_date", "date_created", "created_at"))
+        parent = activity.get("_lookup_parent") or "Copper record"
+        details = _compact_text(activity.get("details") or activity.get("body") or "", 700)
+        if details:
+            activity_lines.append(f"- {date_text} / {parent}: {details}")
+
+    if not activity_lines:
+        return ""
+
+    prompt = f"""
+Summarize this Copper CRM relationship lookup for Slack.
+
+Query: {query}
+Matched companies: {company_names}
+Matched people/team contacts: {contact_names}
+
+Copper activity timeline:
+{chr(10).join(activity_lines)}
+
+Return 4-6 concise bullets. Include:
+- who we interacted with
+- the oldest meaningful contact and latest contact
+- what happened / context
+- current status or next unresolved question if visible
+- why they rejected/passed/lost interest only if the notes clearly say so; otherwise say no explicit rejection reason found
+
+Do not invent facts. Do not recommend writing to Copper. Keep under 900 characters.
+""".strip()
+
+    try:
+        response = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": "You write concise CRM relationship summaries from provided Copper activity only."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return truncate((response.choices[0].message.content or "").strip(), 1000)
+    except Exception:
+        log.exception("Copper relationship brief failed")
+        return ""
+
+
 def format_lookup(query_type: str, query: str) -> str:
     log.info("Lookup query detected: type=%s query=%s", query_type, query)
 
-    direct_people = _safe_search("people", {"name": query, "page_size": 5})
-    companies = _safe_search("companies", {"name": query, "page_size": 5})
-    opportunities = _safe_search("opportunities", {"name": query, "page_size": 5})
+    direct_people = _people_matches_for_query(query)
+    companies = _company_matches_for_query(query)
+    opportunities = _opportunity_matches_for_query(query)
     team_people = _team_people_for_companies(companies)
     people = _dedupe_records(direct_people + team_people)
     records_by_type = {
@@ -999,6 +1140,16 @@ def format_lookup(query_type: str, query: str) -> str:
         lines.append("\n*Relationship context*")
         lines.extend(context_lines)
 
+    brief = _relationship_brief(query, activities, people, companies)
+    if brief:
+        lines.append("\n*Relationship brief*")
+        lines.append(brief)
+
+    timeline_lines = _timeline_lines(activities)
+    if timeline_lines:
+        lines.append("\n*Interaction timeline*")
+        lines.extend(timeline_lines)
+
     if tasks:
         lines.append("\n*Open tasks*")
         for task in tasks[:5]:
@@ -1007,10 +1158,7 @@ def format_lookup(query_type: str, query: str) -> str:
     if activities:
         lines.append("\n*Recent activity/notes*")
         for activity in activities[:6]:
-            date_text = _format_date_from_ts(_timestamp_from_record(activity, "activity_date", "date_created", "created_at"))
-            parent_text = f"{activity.get('_lookup_parent')}: " if activity.get("_lookup_parent") else ""
-            details = _compact_text(activity.get("details") or activity.get("body") or "Activity found", 220)
-            lines.append(f"• {date_text}: {parent_text}{details}")
+            lines.append(_interaction_line(activity, 220))
 
     return truncate("\n".join(lines), 3500)
 
@@ -1023,6 +1171,8 @@ LOOKUP_FIX_ACTIVE_2026_06_04
 LOOKUP_LOOK_UP_ALIAS_ACTIVE_2026_06_04
 LOOKUP_CONTEXT_ACTIVE_2026_06_04
 LOOKUP_TEAM_CONTEXT_ACTIVE_2026_06_04
+LOOKUP_TIMELINE_ACTIVE_2026_06_04
+LOOKUP_RELATIONSHIP_BRIEF_ACTIVE_2026_06_04
 
 • `@{BOT_DISPLAY_NAME} ping` — test that I’m running
 • `@{BOT_DISPLAY_NAME} pipelines` — show Copper pipeline/stage IDs
