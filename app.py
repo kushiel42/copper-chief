@@ -314,11 +314,25 @@ class CopperClient:
 
         try:
             return self.request("POST", "/people", payload)
-        except CopperError:
+        except CopperError as e:
+            if "422" in str(e) and "email" in str(e).lower() and email:
+                # Email already exists on another person record — find and return it
+                matches = self.search("people", {"emails": [email], "page_size": 5})
+                if matches:
+                    log.info("Person email conflict for %s — returning existing record #%s", name, matches[0].get("id"))
+                    return matches[0]
             # Some Copper accounts/layouts reject company_id on person creation. Retry without it.
             if "company_id" in payload:
                 payload.pop("company_id", None)
-                return self.request("POST", "/people", payload)
+                try:
+                    return self.request("POST", "/people", payload)
+                except CopperError as e2:
+                    if "422" in str(e2) and "email" in str(e2).lower() and email:
+                        matches = self.search("people", {"emails": [email], "page_size": 5})
+                        if matches:
+                            log.info("Person email conflict (no company_id) for %s — returning existing record #%s", name, matches[0].get("id"))
+                            return matches[0]
+                    raise
             raise
 
     def resolve_pipeline_stage(self, stage_name: Optional[str], pipeline_name: Optional[str]) -> Tuple[Optional[int], Optional[int]]:
@@ -510,7 +524,8 @@ PARSING RULES:
 
 1. STRUCTURED HANDOFF FORMAT
    If the message contains labelled fields like "From:", "Company:", "Person:", "Relation:", "Summary:",
-   or a "Suggested CRM action:" block — treat those as ground truth. Do not override them from the body text.
+   "Current Stage:", or a "Suggested CRM action:" block — treat those as ground truth. Do not override them
+   from the body text. If "Current Stage:" or "Move to stage:" is provided, use it exactly.
 
 2. RELATION TYPE — critical for deciding whether to create an opportunity:
    Set relation_type based on the "Relation:" field or context:
@@ -528,9 +543,20 @@ PARSING RULES:
 4. OPPORTUNITY NAMING — use "<Firm Name> Investment" if the firm is the investor, or "<Person Name> Investment"
    only if there is no firm. Never name it after a connector or introducer.
 
-5. STAGE — use plain-language Copper stages only when there is real deal progression evidence:
-   Intro, First Call, Follow-up, Diligence, Partner Meeting, Soft Commit, Committed, Won, Lost.
-   Default to "Intro" only for actual investor first-touch. Leave null for connectors.
+5. STAGE — you MUST always set a stage for investor opportunities. Use ONLY these exact stage names from the pipeline:
+   - "Introductions Requested" → we have asked a connector for an intro but it has NOT happened yet
+   - "Contacted"               → intro was made OR first email/message exchanged with the investor directly
+   - "Call Booked"             → a call or meeting is scheduled or confirmed
+   - "Diligence"               → investor is actively reviewing materials, asking questions, or in DD
+   - "Soft Commit"             → investor gave a verbal yes or strong indication they are in
+   - "Wired"                   → money received or term sheet fully signed
+   - "Passed"                  → investor declined, passed, or said not a fit
+
+   Stage selection rules:
+   - If an intro was MADE (connector already sent the email) → "Contacted", NOT "Introductions Requested"
+   - "Introductions Requested" is ONLY for intros we asked for but are still waiting on
+   - On follow-up updates always re-evaluate and move the stage forward if warranted — never leave it at the previous stage if something progressed
+   - Default for a brand new investor contact with no other context: "Contacted"
 
 6. ACTIVITY NOTE — write a clean, factual 1-3 sentence note. If a "Suggested CRM action:" block provides
    an activity note, use it verbatim or clean it up slightly. Do not repeat the full email/transcript.
@@ -1638,12 +1664,13 @@ def process_text_for_crm(
 # -----------------------------
 # Slack event handlers
 # -----------------------------
-def _is_duplicate_event(event: Dict[str, Any]) -> bool:
+def _is_duplicate_event(event: Dict[str, Any], body: Optional[Dict[str, Any]] = None) -> bool:
     """Return True if this Slack event was already processed (dedup for retries)."""
-    # Prefer client_msg_id (user messages) then event_id passed via body, then ts+channel
+    # event_id is in the outer envelope (body), not the inner event dict
+    # client_msg_id only exists on human messages, not bot posts
     event_id = (
-        event.get("client_msg_id")
-        or event.get("event_id")
+        (body or {}).get("event_id")
+        or event.get("client_msg_id")
         or f"{event.get('channel')}:{event.get('ts')}"
     )
     if not event_id:
@@ -1661,8 +1688,8 @@ def _is_duplicate_event(event: Dict[str, Any]) -> bool:
 
 
 @app.event("app_mention")
-def on_app_mention(event, say, client):
-    if _is_duplicate_event(event):
+def on_app_mention(event, body, say, client):
+    if _is_duplicate_event(event, body):
         return
     raw_text = event.get("text") or ""
     bot_handoff = is_bot_handoff_event(event, raw_text)
@@ -1687,10 +1714,10 @@ def on_app_mention(event, say, client):
 
 
 @app.event("message")
-def on_message(event, say, client):
+def on_message(event, body, say, client):
     # DMs are subscribed in the manifest. Bot messages are ignored unless they are
     # explicit CRM_HANDOFF messages, which is the clean path for Viktor/email agents.
-    if _is_duplicate_event(event):
+    if _is_duplicate_event(event, body):
         return
     raw_text = event.get("text") or ""
     bot_handoff = is_bot_handoff_event(event, raw_text)
