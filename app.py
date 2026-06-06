@@ -46,6 +46,8 @@ CRM_HANDOFF_CHANNEL_IDS = {
 
 NY_TZ = ZoneInfo("America/New_York")
 PENDING: Dict[str, Dict[str, Any]] = {}
+PROCESSED_EVENT_IDS: Dict[str, float] = {}  # event_id -> timestamp, for dedup
+PROCESSED_EVENT_TTL = 300  # seconds; Slack retries within ~1 min, 5 min is safe
 
 required = {
     "SLACK_BOT_TOKEN": SLACK_BOT_TOKEN,
@@ -265,7 +267,20 @@ class CopperClient:
             payload["email_domain"] = company["website_domain"]
         if company.get("details"):
             payload["details"] = truncate(company["details"], 2000)
-        return self.request("POST", "/companies", payload)
+        try:
+            return self.request("POST", "/companies", payload)
+        except CopperError as e:
+            if "422" in str(e) and "email_domain" in payload:
+                # Another company already owns this domain — find and return it
+                domain = payload["email_domain"]
+                domain_matches = self.search("companies", {"email_domain": domain, "page_size": 5})
+                if domain_matches:
+                    log.info("Company domain conflict for %s — returning existing record #%s", name, domain_matches[0].get("id"))
+                    return domain_matches[0]
+                # Domain conflict but no match found — retry without the domain
+                payload.pop("email_domain", None)
+                return self.request("POST", "/companies", payload)
+            raise
 
     def get_or_create_person(self, person: Dict[str, Any], company_id: Optional[int]) -> Optional[Dict[str, Any]]:
         if not person:
@@ -1623,8 +1638,32 @@ def process_text_for_crm(
 # -----------------------------
 # Slack event handlers
 # -----------------------------
+def _is_duplicate_event(event: Dict[str, Any]) -> bool:
+    """Return True if this Slack event was already processed (dedup for retries)."""
+    # Prefer client_msg_id (user messages) then event_id passed via body, then ts+channel
+    event_id = (
+        event.get("client_msg_id")
+        or event.get("event_id")
+        or f"{event.get('channel')}:{event.get('ts')}"
+    )
+    if not event_id:
+        return False
+    now = time.time()
+    # Prune stale entries
+    stale = [k for k, v in PROCESSED_EVENT_IDS.items() if now - v > PROCESSED_EVENT_TTL]
+    for k in stale:
+        PROCESSED_EVENT_IDS.pop(k, None)
+    if event_id in PROCESSED_EVENT_IDS:
+        log.info("Dropping duplicate Slack event %s", event_id)
+        return True
+    PROCESSED_EVENT_IDS[event_id] = now
+    return False
+
+
 @app.event("app_mention")
 def on_app_mention(event, say, client):
+    if _is_duplicate_event(event):
+        return
     raw_text = event.get("text") or ""
     bot_handoff = is_bot_handoff_event(event, raw_text)
     if event.get("bot_id") and not bot_handoff:
@@ -1651,6 +1690,8 @@ def on_app_mention(event, say, client):
 def on_message(event, say, client):
     # DMs are subscribed in the manifest. Bot messages are ignored unless they are
     # explicit CRM_HANDOFF messages, which is the clean path for Viktor/email agents.
+    if _is_duplicate_event(event):
+        return
     raw_text = event.get("text") or ""
     bot_handoff = is_bot_handoff_event(event, raw_text)
     if event.get("bot_id") and not bot_handoff:
